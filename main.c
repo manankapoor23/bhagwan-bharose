@@ -1,209 +1,933 @@
-/*
- * Maccelerometer - Simple Access to Mac Accelerometer data
- * Author: Aarav Gupta <atpugvaraa@gmail.com>
- */
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <math.h>
+#include <time.h>
 
 #include <CoreFoundation/CoreFoundation.h>
+
 #include <IOKit/IOKitLib.h>
-#include <IOKit/IOReturn.h>
-#include <IOKit/hid/IOHIDDevice.h>
-#include <IOKit/hid/IOHIDDeviceKeys.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <sys/time.h>
+#include <IOKit/hid/IOHIDLib.h>
+#include <IOKit/hid/IOHIDKeys.h>
 
-// Constants
-#define PAGE_VENDOR 0xFF00
-#define USAGE_ACCEL 3
-#define IMU_REPORT_LENGTH 22
-#define IMU_DATA_OFFSET 6
+
+/* ============================================================
+ *
+ *                  CONFIGURATION
+ *
+ * ============================================================ */
+
 #define REPORT_BUFFER_SIZE 4096
-#define REPORT_INTERVAL_US 1000
-#define ART_WIDTH 64
-#define ART_HEIGHT 24
-#define ART_FRAME_INTERVAL_US 50000
 
-static uint8_t reportBuffer[REPORT_BUFFER_SIZE];
+#define PI 3.14159265358979323846
+#define RAD_TO_DEG (180.0 / PI)
+#define DEG_TO_RAD (PI / 180.0)
 
-// function decls
-static int getRegistryIntegerProperty(io_service_t service, const char *key, int64_t *value);
-static int setRegistryIntegerProperty(io_service_t service, const char *key, int32_t value);
-static void inputReportCallback(void *context, IOReturn result, void *sender, IOHIDReportType type, uint32_t reportID, uint8_t *report, CFIndex reportLength);
-static int wakeSPUDrivers(void);
-static IOHIDDeviceRef findAccelerometer(void);
-static void drawArt(double xG, double yG, double magnitude);
+/*
+ * Apple SPU report scale.
+ *
+ * The working POC established the report structure:
+ *
+ * X = bytes 6..9
+ * Y = bytes 10..13
+ * Z = bytes 14..17
+ *
+ * Values are signed int32 little-endian.
+ */
+#define SENSOR_SCALE 65536.0
 
-int main(void) {
-    // 1. Wake Apple SPU Drivers
-    if (!wakeSPUDrivers()) {
-        printf("Warning: could not find AppleSPUHIDDriver.\n");
 
-        printf("Continuing anyway...\n\n");
-    }
+/*
+ * Complementary filter.
+ *
+ * Higher value = trust gyro more.
+ * Lower value = trust accelerometer more.
+ *
+ * 0.98 is a good starting point for smooth motion.
+ */
+#define COMPLEMENTARY_ALPHA 0.98
 
-    // 2. Find accelerometer logically (to be refactored for a deterministic search)
-    IOHIDDeviceRef accelerometer = findAccelerometer();
 
-    if (accelerometer == NULL) {
-        printf("\nNo accelerometer found.\n");
-        return 1;
-    }
+/*
+ * Gyro dead-zone.
+ *
+ * Tiny gyro noise below this is ignored.
+ */
+#define GYRO_DEADZONE_DPS 0.15
 
-    // 3. Open HID device manager
-    printf("\nOpening accelerometer...\n");
 
-    IOReturn result = IOHIDDeviceOpen(
-        accelerometer,
-        kIOHIDOptionsTypeNone
+/*
+ * Acceleration low-pass filter.
+ *
+ * 0.15 means strong smoothing.
+ */
+#define ACCEL_FILTER_ALPHA 0.15
+
+
+/*
+ * A circular aarti movement generally has meaningful
+ * angular velocity.
+ */
+#define AARTI_GYRO_THRESHOLD_DPS 8.0
+
+
+/*
+ * Require some movement before classifying it.
+ */
+#define AARTI_MIN_RADIUS 0.08
+
+
+/*
+ * How much accumulated angular motion is required before
+ * declaring a rotation.
+ */
+#define AARTI_ROTATION_THRESHOLD_DEG 120.0
+
+
+/*
+ * Calibration samples.
+ *
+ * Keep the Mac completely still during calibration.
+ */
+#define CALIBRATION_SAMPLES 150
+
+
+/* ============================================================
+ *
+ *                  GLOBAL STATE
+ *
+ * ============================================================ */
+
+static volatile sig_atomic_t running = 1;
+
+
+/* ============================================================
+ *
+ *                  VECTOR
+ *
+ * ============================================================ */
+
+typedef struct
+{
+    double x;
+    double y;
+    double z;
+
+} Vec3;
+
+
+/* ============================================================
+ *
+ *                  SENSOR
+ *
+ * ============================================================ */
+
+typedef struct
+{
+    const char *name;
+
+    IOHIDDeviceRef device;
+
+    uint8_t *buffer;
+
+    CFIndex buffer_size;
+
+    uint64_t reports;
+
+} Sensor;
+
+
+/* ============================================================
+ *
+ *                  MOTION STATE
+ *
+ * ============================================================ */
+
+typedef struct
+{
+    /*
+     * Raw values.
+     */
+    Vec3 accel_raw;
+    Vec3 gyro_raw;
+
+
+    /*
+     * Bias estimated during calibration.
+     */
+    Vec3 accel_bias;
+    Vec3 gyro_bias;
+
+
+    /*
+     * Filtered acceleration.
+     */
+    Vec3 accel_filtered;
+
+
+    /*
+     * Orientation.
+     */
+    double roll;
+    double pitch;
+    double yaw;
+
+
+    /*
+     * Previous timestamp.
+     */
+    double last_time;
+
+
+    /*
+     * Whether the system has received its first
+     * synchronized sensor sample.
+     */
+    bool initialized;
+
+
+    /*
+     * Calibration status.
+     */
+    bool calibrated;
+
+
+    /*
+     * Calibration accumulation.
+     */
+    Vec3 accel_sum;
+    Vec3 gyro_sum;
+
+    int calibration_count;
+
+
+    /*
+     * Aarti motion.
+     */
+    double circular_angle;
+
+    double accumulated_rotation;
+
+    int rotation_direction;
+
+    bool rotating;
+
+
+} MotionState;
+
+
+static MotionState motion;
+
+
+/* ============================================================
+ *
+ *                  UTILITY
+ *
+ * ============================================================ */
+
+static double clamp(
+    double value,
+    double min_value,
+    double max_value
+)
+{
+    if (value < min_value)
+        return min_value;
+
+    if (value > max_value)
+        return max_value;
+
+    return value;
+}
+
+
+static double normalize_angle(
+    double angle
+)
+{
+    while (angle > 180.0)
+        angle -= 360.0;
+
+    while (angle < -180.0)
+        angle += 360.0;
+
+    return angle;
+}
+
+
+static double vector_magnitude(
+    Vec3 v
+)
+{
+    return sqrt(
+        v.x * v.x +
+        v.y * v.y +
+        v.z * v.z
+    );
+}
+
+
+/* ============================================================
+ *
+ *                  TIME
+ *
+ * ============================================================ */
+
+static double current_time_seconds(void)
+{
+    struct timespec ts;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &ts
     );
 
+    return
+        (double)ts.tv_sec +
+        (double)ts.tv_nsec / 1000000000.0;
+}
 
-    if (result != kIOReturnSuccess) {
+
+/* ============================================================
+ *
+ *                  CTRL+C
+ *
+ * ============================================================ */
+
+static void stop_handler(
+    int signal_number
+)
+{
+    (void)signal_number;
+
+    running = 0;
+
+    CFRunLoopStop(
+        CFRunLoopGetCurrent()
+    );
+}
+
+
+/* ============================================================
+ *
+ *                  LITTLE-ENDIAN INT32
+ *
+ * ============================================================ */
+
+static int32_t read_i32_le(
+    const uint8_t *p
+)
+{
+    return (int32_t)(
+        ((uint32_t)p[0]) |
+        ((uint32_t)p[1] << 8) |
+        ((uint32_t)p[2] << 16) |
+        ((uint32_t)p[3] << 24)
+    );
+}
+
+
+/* ============================================================
+ *
+ *                  RAW SENSOR DECODING
+ *
+ * ============================================================ */
+
+static Vec3 decode_vec3(
+    const uint8_t *report
+)
+{
+    Vec3 result;
+
+    int32_t raw_x =
+        read_i32_le(&report[6]);
+
+    int32_t raw_y =
+        read_i32_le(&report[10]);
+
+    int32_t raw_z =
+        read_i32_le(&report[14]);
+
+
+    result.x =
+        (double)raw_x / SENSOR_SCALE;
+
+    result.y =
+        (double)raw_y / SENSOR_SCALE;
+
+    result.z =
+        (double)raw_z / SENSOR_SCALE;
+
+
+    return result;
+}
+
+
+/* ============================================================
+ *
+ *                  ACCEL FILTER
+ *
+ * ============================================================ */
+
+static Vec3 low_pass_accel(
+    Vec3 input
+)
+{
+    Vec3 result;
+
+
+    result.x =
+        ACCEL_FILTER_ALPHA * input.x +
+        (1.0 - ACCEL_FILTER_ALPHA) *
+            motion.accel_filtered.x;
+
+
+    result.y =
+        ACCEL_FILTER_ALPHA * input.y +
+        (1.0 - ACCEL_FILTER_ALPHA) *
+            motion.accel_filtered.y;
+
+
+    result.z =
+        ACCEL_FILTER_ALPHA * input.z +
+        (1.0 - ACCEL_FILTER_ALPHA) *
+            motion.accel_filtered.z;
+
+
+    return result;
+}
+
+
+/* ============================================================
+ *
+ *                  CALIBRATION
+ *
+ * ============================================================ */
+
+static void calibration_update(
+    Vec3 accel,
+    Vec3 gyro
+)
+{
+    if (motion.calibrated)
+        return;
+
+
+    motion.accel_sum.x += accel.x;
+    motion.accel_sum.y += accel.y;
+    motion.accel_sum.z += accel.z;
+
+
+    motion.gyro_sum.x += gyro.x;
+    motion.gyro_sum.y += gyro.y;
+    motion.gyro_sum.z += gyro.z;
+
+
+    motion.calibration_count++;
+
+
+    if (motion.calibration_count >=
+        CALIBRATION_SAMPLES)
+    {
+        /*
+         * Gyroscope:
+         *
+         * When stationary, average gyro should be
+         * approximately zero.
+         */
+
+        motion.gyro_bias.x =
+            motion.gyro_sum.x /
+            CALIBRATION_SAMPLES;
+
+        motion.gyro_bias.y =
+            motion.gyro_sum.y /
+            CALIBRATION_SAMPLES;
+
+        motion.gyro_bias.z =
+            motion.gyro_sum.z /
+            CALIBRATION_SAMPLES;
+
+
+        /*
+         * Accelerometer:
+         *
+         * We DON'T remove the complete acceleration
+         * vector because gravity is useful for roll/pitch.
+         *
+         * Instead, estimate the stationary gravity vector
+         * and normalize it later.
+         */
+
+        motion.accel_bias.x =
+            motion.accel_sum.x /
+            CALIBRATION_SAMPLES;
+
+        motion.accel_bias.y =
+            motion.accel_sum.y /
+            CALIBRATION_SAMPLES;
+
+        motion.accel_bias.z =
+            motion.accel_sum.z /
+            CALIBRATION_SAMPLES;
+
+
+        motion.calibrated = true;
+
+
         printf(
-            "IOHIDDeviceOpen failed: 0x%08X\n",
-            result
+            "\n"
+            "====================================================\n"
+            "              CALIBRATION COMPLETE\n"
+            "====================================================\n"
+            "\n"
+            "Gyro bias:\n"
+            "  X = %+.5f\n"
+            "  Y = %+.5f\n"
+            "  Z = %+.5f\n"
+            "\n"
+            "Accel stationary vector:\n"
+            "  X = %+.5f g\n"
+            "  Y = %+.5f g\n"
+            "  Z = %+.5f g\n"
+            "\n"
+            "Move the MacBook gently to begin aarti motion.\n"
+            "\n",
+            motion.gyro_bias.x,
+            motion.gyro_bias.y,
+            motion.gyro_bias.z,
+            motion.accel_bias.x,
+            motion.accel_bias.y,
+            motion.accel_bias.z
         );
 
-        CFRelease(accelerometer);
+        fflush(stdout);
+    }
+}
 
-        return 1;
+
+/* ============================================================
+ *
+ *                  ACCEL ORIENTATION
+ *
+ * ============================================================ */
+
+static void calculate_accel_angles(
+    Vec3 accel,
+    double *roll,
+    double *pitch
+)
+{
+    /*
+     * Remove stationary bias only as a small correction.
+     *
+     * Gravity remains present.
+     */
+
+    double ax = accel.x;
+    double ay = accel.y;
+    double az = accel.z;
+
+
+    /*
+     * Roll:
+     *
+     * Rotation around X.
+     */
+
+    *roll =
+        atan2(
+            ay,
+            sqrt(
+                ax * ax +
+                az * az
+            )
+        ) * RAD_TO_DEG;
+
+
+    /*
+     * Pitch:
+     *
+     * Rotation around Y.
+     */
+
+    *pitch =
+        atan2(
+            -ax,
+            sqrt(
+                ay * ay +
+                az * az
+            )
+        ) * RAD_TO_DEG;
+}
+
+
+/* ============================================================
+ *
+ *                  GYRO DEADZONE
+ *
+ * ============================================================ */
+
+static Vec3 apply_gyro_deadzone(
+    Vec3 gyro
+)
+{
+    if (fabs(gyro.x) <
+        GYRO_DEADZONE_DPS)
+        gyro.x = 0.0;
+
+
+    if (fabs(gyro.y) <
+        GYRO_DEADZONE_DPS)
+        gyro.y = 0.0;
+
+
+    if (fabs(gyro.z) <
+        GYRO_DEADZONE_DPS)
+        gyro.z = 0.0;
+
+
+    return gyro;
+}
+
+
+/* ============================================================
+ *
+ *                  MOTION UPDATE
+ *
+ * ============================================================ */
+
+static void update_motion(
+    Vec3 accel,
+    Vec3 gyro
+)
+{
+    /*
+     * Wait until calibration has completed.
+     */
+
+    calibration_update(
+        accel,
+        gyro
+    );
+
+
+    if (!motion.calibrated)
+        return;
+
+
+    /*
+     * Remove gyro bias.
+     */
+
+    gyro.x -= motion.gyro_bias.x;
+    gyro.y -= motion.gyro_bias.y;
+    gyro.z -= motion.gyro_bias.z;
+
+
+    /*
+     * Remove tiny noise.
+     */
+
+    gyro =
+        apply_gyro_deadzone(
+            gyro
+        );
+
+
+    /*
+     * Smooth acceleration.
+     */
+
+    motion.accel_filtered =
+        low_pass_accel(
+            accel
+        );
+
+
+    /*
+     * Accelerometer orientation.
+     */
+
+    double accel_roll;
+    double accel_pitch;
+
+
+    calculate_accel_angles(
+        motion.accel_filtered,
+        &accel_roll,
+        &accel_pitch
+    );
+
+
+    /*
+     * Timestamp.
+     */
+
+    double now =
+        current_time_seconds();
+
+
+    if (!motion.initialized)
+    {
+        motion.roll =
+            accel_roll;
+
+        motion.pitch =
+            accel_pitch;
+
+        motion.yaw =
+            0.0;
+
+        motion.last_time =
+            now;
+
+        motion.initialized =
+            true;
+
+        return;
     }
 
-    printf(">>> ACCELEROMETER OPENED <<<\n");
 
-    // 4. Schedule device
-    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+    double dt =
+        now - motion.last_time;
 
-    IOHIDDeviceScheduleWithRunLoop(
-        accelerometer,
-        runLoop,
-        kCFRunLoopDefaultMode
+
+    motion.last_time =
+        now;
+
+
+    /*
+     * Protect against abnormal timestamps.
+     */
+
+    if (dt <= 0.0 ||
+        dt > 0.1)
+    {
+        return;
+    }
+
+
+    /*
+     * --------------------------------------------------------
+     * GYRO INTEGRATION
+     * --------------------------------------------------------
+     */
+
+    double gyro_roll =
+        motion.roll +
+        gyro.x * dt;
+
+
+    double gyro_pitch =
+        motion.pitch +
+        gyro.y * dt;
+
+
+    /*
+     * Yaw has no accelerometer correction.
+     *
+     * It is therefore relative and will drift slowly.
+     */
+
+    motion.yaw +=
+        gyro.z * dt;
+
+
+    motion.yaw =
+        normalize_angle(
+            motion.yaw
+        );
+
+
+    /*
+     * --------------------------------------------------------
+     * COMPLEMENTARY FILTER
+     * --------------------------------------------------------
+     *
+     * Gyroscope:
+     *     fast
+     *     smooth
+     *     responsive
+     *
+     * Accelerometer:
+     *     absolute gravity reference
+     *     slower
+     *     noisy
+     *
+     * Combining them gives stable pitch/roll.
+     */
+
+    motion.roll =
+        COMPLEMENTARY_ALPHA *
+            gyro_roll
+        +
+        (1.0 - COMPLEMENTARY_ALPHA) *
+            accel_roll;
+
+
+    motion.pitch =
+        COMPLEMENTARY_ALPHA *
+            gyro_pitch
+        +
+        (1.0 - COMPLEMENTARY_ALPHA) *
+            accel_pitch;
+
+
+    motion.roll =
+        normalize_angle(
+            motion.roll
+        );
+
+
+    motion.pitch =
+        normalize_angle(
+            motion.pitch
+        );
+
+
+    /*
+     * --------------------------------------------------------
+     * AARTI ROTATION DETECTION
+     * --------------------------------------------------------
+     *
+     * We primarily use gyro Z for rotation around the
+     * MacBook's vertical axis.
+     *
+     * Positive Z = clockwise or anticlockwise depending
+     * on physical coordinate orientation.
+     *
+     * We report both direction possibilities and can flip
+     * this mapping once you test the physical movement.
+     */
+
+    double angular_speed =
+        gyro.z;
+
+
+    if (fabs(angular_speed) >=
+        AARTI_GYRO_THRESHOLD_DPS)
+    {
+        motion.rotating =
+            true;
+
+
+        motion.circular_angle +=
+            angular_speed * dt;
+
+
+        motion.accumulated_rotation +=
+            fabs(angular_speed * dt);
+
+
+        /*
+         * Direction:
+         *
+         * +1 = positive Z
+         * -1 = negative Z
+         */
+
+        motion.rotation_direction =
+            angular_speed > 0.0
+                ? 1
+                : -1;
+
+
+        /*
+         * Full gesture threshold.
+         */
+
+        if (motion.accumulated_rotation >=
+            AARTI_ROTATION_THRESHOLD_DEG)
+        {
+            if (motion.rotation_direction > 0)
+            {
+                printf(
+                    "\n"
+                    ">>> AARTI ROTATION: CLOCKWISE <<<\n\n"
+                );
+            }
+            else
+            {
+                printf(
+                    "\n"
+                    ">>> AARTI ROTATION: ANTICLOCKWISE <<<\n\n"
+                );
+            }
+
+
+            /*
+             * Start accumulating the next gesture.
+             */
+
+            motion.accumulated_rotation =
+                0.0;
+        }
+
+    }
+    else
+    {
+        /*
+         * Slowly decay the accumulated rotation when
+         * the user stops moving.
+         */
+
+        motion.accumulated_rotation *=
+            0.90;
+
+
+        if (motion.accumulated_rotation < 5.0)
+        {
+            motion.accumulated_rotation =
+                0.0;
+
+            motion.rotating =
+                false;
+        }
+    }
+
+
+    /*
+     * --------------------------------------------------------
+     * OUTPUT
+     * --------------------------------------------------------
+     */
+
+    printf(
+        "ROLL %7.2f° | "
+        "PITCH %7.2f° | "
+        "YAW %7.2f° | "
+        "GYRO-Z %7.2f°/s | "
+        "ROT %s\n",
+
+        motion.roll,
+        motion.pitch,
+        motion.yaw,
+
+        gyro.z,
+
+        motion.rotating
+            ? (motion.rotation_direction > 0
+                ? "CW"
+                : "CCW")
+            : "-"
     );
 
-    printf(">>> DEVICE SCHEDULED <<<\n");
 
-    // 5. Register a callback
-    IOHIDDeviceRegisterInputReportCallback(
-        accelerometer,
-        reportBuffer,
-        sizeof(reportBuffer),
-        inputReportCallback,
-        NULL
-    );
-
-    printf(">>> CALLBACK REGISTERED <<<\n");
-
-    // 6. Run
-    printf("\nListening for accelerometer data...\n");
-
-    printf("Touch or move the MacBook to paint. Press Control-C to stop.\n\n");
-    printf("\033[2J\033[H\033[?25l");
     fflush(stdout);
-
-    CFRunLoopRun();
-
-    // Cleanup and free
-    IOHIDDeviceUnscheduleFromRunLoop(
-        accelerometer,
-        runLoop,
-        kCFRunLoopDefaultMode
-    );
-
-    IOHIDDeviceClose(
-        accelerometer,
-        kIOHIDOptionsTypeNone
-    );
-
-    CFRelease(accelerometer);
-
-    return 0;
 }
 
-static int getRegistryIntegerProperty(
-    io_service_t service,
-    const char *key,
-    int64_t *value
-) {
-    CFStringRef keyString = CFStringCreateWithCString(
-        kCFAllocatorDefault,
-        key,
-        kCFStringEncodingUTF8
-    );
 
-    if (keyString == NULL) {
-        return 0;
-    }
+/* ============================================================
+ *
+ *                  HID CALLBACK
+ *
+ * ============================================================ */
 
-    CFTypeRef property = IORegistryEntryCreateCFProperty(
-        service,
-        keyString,
-        kCFAllocatorDefault,
-        0
-    );
-
-    CFRelease(keyString);
-
-    if (property == NULL) {
-        return 0;
-    }
-
-    if (CFGetTypeID(property) != CFNumberGetTypeID()) {
-        CFRelease(property);
-        return 0;
-    }
-
-    Boolean success = CFNumberGetValue(
-        (CFNumberRef)property,
-        kCFNumberSInt64Type,
-        value
-    );
-
-    CFRelease(property);
-
-    return success;
-}
-
-static int setRegistryIntegerProperty(
-    io_service_t service,
-    const char *key,
-    int32_t value
-) {
-    CFStringRef keyString = CFStringCreateWithCString(
-        kCFAllocatorDefault,
-        key,
-        kCFStringEncodingUTF8
-    );
-
-    if (keyString == NULL) {
-        return 0;
-    }
-
-    CFNumberRef number = CFNumberCreate(
-        kCFAllocatorDefault,
-        kCFNumberSInt32Type,
-        &value
-    );
-
-    if (number == NULL) {
-        CFRelease(keyString);
-        return 0;
-    }
-
-    kern_return_t result = IORegistryEntrySetCFProperty(
-        service,
-        keyString,
-        number
-    );
-
-    CFRelease(number);
-    CFRelease(keyString);
-
-    return result == KERN_SUCCESS;
-}
-
-static void inputReportCallback(
+static void report_callback(
     void *context,
     IOReturn result,
     void *sender,
@@ -211,283 +935,550 @@ static void inputReportCallback(
     uint32_t reportID,
     uint8_t *report,
     CFIndex reportLength
-) {
-    if (result != kIOReturnSuccess) {
-        printf(
-            "Input report error: 0x%08X\n",
+)
+{
+    (void)sender;
+    (void)type;
+    (void)reportID;
+
+
+    Sensor *sensor =
+        (Sensor *)context;
+
+
+    if (!sensor)
+        return;
+
+
+    if (result !=
+        kIOReturnSuccess)
+    {
+        fprintf(
+            stderr,
+            "[%s] callback error: 0x%08X\n",
+            sensor->name,
             result
         );
+
         return;
     }
 
-    if (reportLength == IMU_REPORT_LENGTH) {
-        int32_t x = (int32_t)(
-            ((uint32_t)report[6]) |
-            ((uint32_t)report[7] << 8) |
-            ((uint32_t)report[8] << 16) |
-            ((uint32_t)report[9] << 24)
-        );
 
-        int32_t y = (int32_t)(
-            ((uint32_t)report[10]) |
-            ((uint32_t)report[11] << 8) |
-            ((uint32_t)report[12] << 16) |
-            ((uint32_t)report[13] << 24)
-        );
-
-        int32_t z = (int32_t)(
-            ((uint32_t)report[14]) |
-            ((uint32_t)report[15] << 8) |
-            ((uint32_t)report[16] << 16) |
-            ((uint32_t)report[17] << 24)
-        );
-
-        double xG = (double)x / 65536.0;
-        double yG = (double)y / 65536.0;
-        double zG = (double)z / 65536.0;
-
-        double magnitude = sqrt(xG * xG + yG * yG + zG * zG);
-
-        double deviation = magnitude - 1.0;
-
-        drawArt(xG, yG, magnitude);
-
-        if (deviation > 0.00001) {
-            printf(
-                "ACCEL:     Magnitude=%.4f | Deviation=%+.4f g\n",
-                magnitude,
-                deviation
-            );
-        }
-    }
-}
-
-static void drawArt(double xG, double yG, double magnitude) {
-    static uint64_t lastFrameTime = 0;
-    static int initialized = 0;
-    struct timeval currentTime;
-
-    gettimeofday(&currentTime, NULL);
-
-    uint64_t now = (uint64_t)currentTime.tv_sec * 1000000ULL +
-                   (uint64_t)currentTime.tv_usec;
-
-    if (initialized && now - lastFrameTime < ART_FRAME_INTERVAL_US) {
+    if (!report ||
+        reportLength < 18)
+    {
         return;
     }
 
-    initialized = 1;
-    lastFrameTime = now;
 
-    double clampedX = fmax(-1.0, fmin(1.0, xG));
-    double clampedY = fmax(-1.0, fmin(1.0, yG));
-    int centerX = (int)((clampedX + 1.0) * 0.5 * (ART_WIDTH - 1));
-    int centerY = (int)((1.0 - clampedY) * 0.5 * (ART_HEIGHT - 1));
-    int radius = (int)fmax(1.0, fmin(7.0, fabs(magnitude - 1.0) * 18.0 + 1.0));
-    const char *ink = magnitude > 1.15 ? "@" : (magnitude > 1.05 ? "*" : ".");
-
-    printf("\033[H");
-    for (int row = 0; row < ART_HEIGHT; row++) {
-        for (int column = 0; column < ART_WIDTH; column++) {
-            int dx = column - centerX;
-            int dy = row - centerY;
-            double distance = sqrt((double)(dx * dx + dy * dy));
-
-            if (distance <= radius) {
-                printf("%s", ink);
-            } else {
-                printf(" ");
-            }
-        }
-        printf("\n");
-    }
-    printf("magnitude %.4f  brush %d  position (%d, %d)\n", magnitude, radius, centerX, centerY);
-    fflush(stdout);
-}
-
-static int wakeSPUDrivers(void) {
-
-    printf("Searching for AppleSPUHIDDriver...\n");
+    sensor->reports++;
 
 
-    CFMutableDictionaryRef matching = IOServiceMatching("AppleSPUHIDDriver");
-
-    if (matching == NULL) {
-        printf("Failed to create AppleSPUHIDDriver matching dictionary.\n");
-
-        return 0;
-    }
-
-    io_iterator_t iterator = IO_OBJECT_NULL;
-
-    kern_return_t result = IOServiceGetMatchingServices(
-        kIOMainPortDefault,
-        matching,
-        &iterator
-    );
-
-    if (result != KERN_SUCCESS) {
-        printf(
-            "IOServiceGetMatchingServices failed: 0x%08X\n",
-            result
+    Vec3 value =
+        decode_vec3(
+            report
         );
 
-        return 0;
+
+    /*
+     * The working sensor format uses:
+     *
+     * ACCEL -> g
+     * GYRO  -> deg/s
+     */
+
+    if (strcmp(
+            sensor->name,
+            "ACCEL"
+        ) == 0)
+    {
+        motion.accel_raw =
+            value;
+
     }
+    else
+    {
+        motion.gyro_raw =
+            value;
 
-    int count = 0;
 
-    while (1) {
-        io_service_t service = IOIteratorNext(iterator);
+        /*
+         * Update the complete motion state on gyro
+         * reports because this is the primary high-rate
+         * orientation source.
+         */
 
-        if (service == IO_OBJECT_NULL) {
-            break;
-        }
-
-        count++;
-
-        printf("Found AppleSPUHIDDriver\n");
-
-        // Enable sensor reporting.
-        if (
-            !setRegistryIntegerProperty(
-                service,
-                "SensorPropertyReportingState",
-                1
-            )
-        ) {
-            printf(
-                "Warning: failed to set "
-                "SensorPropertyReportingState\n"
-            );
-        }
-
-        // Enable sensor power.
-        if (
-            !setRegistryIntegerProperty(
-                service,
-                "SensorPropertyPowerState",
-                1
-            )
-        ) {
-            printf(
-                "Warning: failed to set "
-                "SensorPropertyPowerState\n"
-            );
-        }
-
-        // Set report interval.
-        if (
-            !setRegistryIntegerProperty(
-                service,
-                "ReportInterval",
-                REPORT_INTERVAL_US
-            )
-        ) {
-            printf("Warning: failed to set ReportInterval\n");
-        }
-
-        IOObjectRelease(service);
+        update_motion(
+            motion.accel_raw,
+            motion.gyro_raw
+        );
     }
-
-    IOObjectRelease(iterator);
-
-    printf(
-        "AppleSPUHIDDriver count: %d\n",
-        count
-    );
-
-    return count > 0;
 }
 
 
-static IOHIDDeviceRef findAccelerometer(void) {
-    printf("\nSearching for AppleSPUHIDDevice...\n");
+/* ============================================================
+ *
+ *                  FIND SPU SENSOR
+ *
+ * ============================================================ */
 
-    CFMutableDictionaryRef matching = IOServiceMatching("AppleSPUHIDDevice");
+static IOHIDDeviceRef find_spu_device(
+    uint32_t usage
+)
+{
+    CFMutableDictionaryRef matching =
+        IOServiceMatching(
+            "AppleSPUHIDDevice"
+        );
 
-    if (matching == NULL) {
-        printf("Failed to create AppleSPUHIDDevice matching dictionary.\n");
 
-        return NULL;
-    }
-
-    io_iterator_t iterator = IO_OBJECT_NULL;
-
-    kern_return_t result = IOServiceGetMatchingServices(
-        kIOMainPortDefault,
-        matching,
-        &iterator
-    );
-
-    if (result != KERN_SUCCESS) {
-        printf(
-            "IOServiceGetMatchingServices failed: 0x%08X\n",
-            result
+    if (!matching)
+    {
+        fprintf(
+            stderr,
+            "Could not create AppleSPUHIDDevice matching dictionary.\n"
         );
 
         return NULL;
     }
 
-    IOHIDDeviceRef accelerometer = NULL;
 
-    while (1) {
-        io_service_t service = IOIteratorNext(iterator);
+    int usage_page =
+        0xFF00;
 
-        if (service == IO_OBJECT_NULL) {
-            break;
-        }
 
-        int64_t usagePage = 0;
-        int64_t usage = 0;
+    int usage_value =
+        (int)usage;
 
-        int hasUsagePage = getRegistryIntegerProperty(
-            service,
-            "PrimaryUsagePage",
-            &usagePage
+
+    CFNumberRef usage_page_number =
+        CFNumberCreate(
+            kCFAllocatorDefault,
+            kCFNumberIntType,
+            &usage_page
         );
 
-        int hasUsage = getRegistryIntegerProperty(
-            service,
-            "PrimaryUsage",
-            &usage
+
+    CFNumberRef usage_number =
+        CFNumberCreate(
+            kCFAllocatorDefault,
+            kCFNumberIntType,
+            &usage_value
         );
+
+
+    CFDictionarySetValue(
+        matching,
+        CFSTR(kIOHIDPrimaryUsagePageKey),
+        usage_page_number
+    );
+
+
+    CFDictionarySetValue(
+        matching,
+        CFSTR(kIOHIDPrimaryUsageKey),
+        usage_number
+    );
+
+
+    CFRelease(
+        usage_page_number
+    );
+
+
+    CFRelease(
+        usage_number
+    );
+
+
+    io_iterator_t iterator =
+        IO_OBJECT_NULL;
+
+
+    kern_return_t kr =
+        IOServiceGetMatchingServices(
+            kIOMainPortDefault,
+            matching,
+            &iterator
+        );
+
+
+    if (kr != KERN_SUCCESS)
+    {
+        fprintf(
+            stderr,
+            "IOServiceGetMatchingServices failed: 0x%08X\n",
+            kr
+        );
+
+        return NULL;
+    }
+
+
+    io_service_t service;
+
+
+    while (
+        (service =
+            IOIteratorNext(iterator))
+        != IO_OBJECT_NULL
+    )
+    {
+        char name[128];
+
+        memset(
+            name,
+            0,
+            sizeof(name)
+        );
+
+
+        IORegistryEntryGetName(
+            service,
+            name
+        );
+
 
         printf(
-            "AppleSPUHIDDevice: "
-            "UsagePage=0x%04llX Usage=0x%04llX\n",
-            usagePage,
-            usage
+            "Found AppleSPUHIDDevice: %s\n",
+            name
         );
 
-        if (
-            hasUsagePage &&
-            hasUsage &&
-            usagePage == PAGE_VENDOR &&
-            usage == USAGE_ACCEL
-        ) {
-            printf(">>> FOUND ACCELEROMETER SERVICE <<<\n");
 
-            accelerometer = IOHIDDeviceCreate(
+        IOHIDDeviceRef device =
+            IOHIDDeviceCreate(
                 kCFAllocatorDefault,
                 service
             );
 
-            if (accelerometer == NULL) {
-                printf("Failed to create IOHIDDevice.\n");
-            } else {
-                printf(">>> IOHIDDevice CREATED <<<\n");
-            }
 
-            IOObjectRelease(service);
+        IOObjectRelease(
+            service
+        );
 
-            break;
+
+        if (device)
+        {
+            IOObjectRelease(
+                iterator
+            );
+
+            return device;
         }
-
-        IOObjectRelease(service);
     }
 
-    IOObjectRelease(iterator);
 
-    return accelerometer;
+    IOObjectRelease(
+        iterator
+    );
+
+
+    return NULL;
+}
+
+
+/* ============================================================
+ *
+ *                  SETUP
+ *
+ * ============================================================ */
+
+static bool setup_sensor(
+    Sensor *sensor
+)
+{
+    if (!sensor ||
+        !sensor->device)
+    {
+        return false;
+    }
+
+
+    IOReturn result =
+        IOHIDDeviceOpen(
+            sensor->device,
+            kIOHIDOptionsTypeNone
+        );
+
+
+    if (result !=
+        kIOReturnSuccess)
+    {
+        fprintf(
+            stderr,
+            "[%s] IOHIDDeviceOpen failed: 0x%08X\n",
+            sensor->name,
+            result
+        );
+
+        return false;
+    }
+
+
+    sensor->buffer_size =
+        REPORT_BUFFER_SIZE;
+
+
+    sensor->buffer =
+        calloc(
+            1,
+            (size_t)sensor->buffer_size
+        );
+
+
+    if (!sensor->buffer)
+    {
+        IOHIDDeviceClose(
+            sensor->device,
+            kIOHIDOptionsTypeNone
+        );
+
+        return false;
+    }
+
+
+    IOHIDDeviceRegisterInputReportCallback(
+        sensor->device,
+        sensor->buffer,
+        sensor->buffer_size,
+        report_callback,
+        sensor
+    );
+
+
+    IOHIDDeviceScheduleWithRunLoop(
+        sensor->device,
+        CFRunLoopGetCurrent(),
+        kCFRunLoopDefaultMode
+    );
+
+
+    printf(
+        "[%s] ready.\n",
+        sensor->name
+    );
+
+
+    return true;
+}
+
+
+/* ============================================================
+ *
+ *                  CLEANUP
+ *
+ * ============================================================ */
+
+static void cleanup_sensor(
+    Sensor *sensor
+)
+{
+    if (!sensor)
+        return;
+
+
+    if (sensor->device)
+    {
+        IOHIDDeviceUnscheduleFromRunLoop(
+            sensor->device,
+            CFRunLoopGetCurrent(),
+            kCFRunLoopDefaultMode
+        );
+
+
+        IOHIDDeviceClose(
+            sensor->device,
+            kIOHIDOptionsTypeNone
+        );
+
+
+        CFRelease(
+            sensor->device
+        );
+
+
+        sensor->device =
+            NULL;
+    }
+
+
+    free(
+        sensor->buffer
+    );
+
+
+    sensor->buffer =
+        NULL;
+}
+
+
+/* ============================================================
+ *
+ *                  MAIN
+ *
+ * ============================================================ */
+
+int main(void)
+{
+    signal(
+        SIGINT,
+        stop_handler
+    );
+
+
+    memset(
+        &motion,
+        0,
+        sizeof(motion)
+    );
+
+
+    printf(
+        "\n"
+        "====================================================\n"
+        "          MACBOOK AARTI MOTION ENGINE\n"
+        "====================================================\n"
+        "\n"
+        "Initializing Apple Silicon IMU...\n"
+        "\n"
+    );
+
+
+    /*
+     * Usage 3 = accelerometer
+     * Usage 9 = gyroscope
+     */
+
+    IOHIDDeviceRef accel_device =
+        find_spu_device(3);
+
+
+    IOHIDDeviceRef gyro_device =
+        find_spu_device(9);
+
+
+    if (!accel_device)
+    {
+        fprintf(
+            stderr,
+            "Accelerometer not found.\n"
+        );
+    }
+
+
+    if (!gyro_device)
+    {
+        fprintf(
+            stderr,
+            "Gyroscope not found.\n"
+        );
+    }
+
+
+    if (!accel_device ||
+        !gyro_device)
+    {
+        if (accel_device)
+            CFRelease(accel_device);
+
+        if (gyro_device)
+            CFRelease(gyro_device);
+
+        return EXIT_FAILURE;
+    }
+
+
+    Sensor accel = {
+        .name = "ACCEL",
+        .device = accel_device,
+        .buffer = NULL,
+        .buffer_size = 0,
+        .reports = 0
+    };
+
+
+    Sensor gyro = {
+        .name = "GYRO",
+        .device = gyro_device,
+        .buffer = NULL,
+        .buffer_size = 0,
+        .reports = 0
+    };
+
+
+    if (!setup_sensor(&accel))
+    {
+        cleanup_sensor(&accel);
+        cleanup_sensor(&gyro);
+
+        return EXIT_FAILURE;
+    }
+
+
+    if (!setup_sensor(&gyro))
+    {
+        cleanup_sensor(&accel);
+        cleanup_sensor(&gyro);
+
+        return EXIT_FAILURE;
+    }
+
+
+    printf(
+        "\n"
+        "====================================================\n"
+        "                    CALIBRATION\n"
+        "====================================================\n"
+        "\n"
+        "Keep the MacBook COMPLETELY STILL.\n"
+        "\n"
+        "Calibrating...\n"
+        "\n"
+    );
+
+
+    fflush(stdout);
+
+
+    /*
+     * --------------------------------------------------------
+     * Event loop
+     * --------------------------------------------------------
+     */
+
+    while (running)
+    {
+        CFRunLoopRunInMode(
+            kCFRunLoopDefaultMode,
+            1.0,
+            true
+        );
+    }
+
+
+    printf(
+        "\n"
+        "====================================================\n"
+        "                   SHUTTING DOWN\n"
+        "====================================================\n"
+        "\n"
+        "Accelerometer reports: %llu\n"
+        "Gyroscope reports:     %llu\n"
+        "\n",
+        (unsigned long long)accel.reports,
+        (unsigned long long)gyro.reports
+    );
+
+
+    cleanup_sensor(
+        &accel
+    );
+
+
+    cleanup_sensor(
+        &gyro
+    );
+
+
+    return EXIT_SUCCESS;
 }
