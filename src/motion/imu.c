@@ -514,6 +514,11 @@ MotionState motion_get_state(void) {
     state.gyro_y = g_motion.gyro_raw.y;
     state.gyro_z = g_motion.gyro_raw.z;
 
+    state.acceleration_x =
+        g_motion.accel_filtered.x - g_motion.accel_stationary.x;
+    state.acceleration_y =
+        g_motion.accel_filtered.y - g_motion.accel_stationary.y;
+
     state.angular_velocity =
         sqrt(
             g_motion.gyro_raw.x * g_motion.gyro_raw.x +

@@ -84,19 +84,30 @@ static NSUInteger lightTrailCount = 0;
     CGFloat centerX = bounds.size.width / 2.0;
     CGFloat centerY = bounds.size.height / 2.0;
 
-    CGFloat motionRadius = MIN(bounds.size.width, bounds.size.height) * 0.22;
-    CGFloat normalizedRoll =
-        fmax(-1.0, fmin(1.0, (CGFloat)state.roll / 15.0));
-    CGFloat normalizedPitch =
-        fmax(-1.0, fmin(1.0, (CGFloat)state.pitch / 15.0));
+    static CGFloat accelerationAngle = 0.0;
+    CGFloat horizontalAcceleration =
+        hypot(state.acceleration_x, state.acceleration_y);
+
+    if (state.calibrated && horizontalAcceleration > 0.015) {
+        accelerationAngle = atan2(
+            state.acceleration_y,
+            state.acceleration_x
+        );
+    }
+
+    CGFloat motionRadius = MIN(bounds.size.width, bounds.size.height) * 0.20;
+    CGFloat normalizedAcceleration =
+        fmax(0.0, fmin(1.0, horizontalAcceleration / 0.35));
+    CGFloat orbitRadius =
+        motionRadius * (0.35 + normalizedAcceleration * 0.65);
 
     CGFloat x =
         centerX +
-        normalizedRoll * motionRadius;
+        cos(accelerationAngle) * orbitRadius;
 
     CGFloat y =
         centerY +
-        normalizedPitch * motionRadius;
+        sin(accelerationAngle) * orbitRadius;
 
     NSPoint p = NSMakePoint(x, y);
 

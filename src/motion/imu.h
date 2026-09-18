@@ -19,6 +19,9 @@ typedef struct {
     double gyro_y;
     double gyro_z;
 
+    double acceleration_x;
+    double acceleration_y;
+
     double angular_velocity;
     double rotation_progress;
 
