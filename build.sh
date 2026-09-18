@@ -9,9 +9,9 @@ clang -Wall -Wextra -Wpedantic -O2 \
   -framework IOKit \
   -framework CoreFoundation \
   -lm \
-  -o aarti
+  -o bhagwan-bharose
 
 echo ""
 echo "Build successful."
 echo "Run with:"
-echo "  sudo ./aarti"
+echo "  sudo ./bhagwan-bharose"

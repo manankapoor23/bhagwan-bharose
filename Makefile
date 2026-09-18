@@ -13,7 +13,7 @@ SOURCES = \
     src/app/main.m \
     src/motion/imu.c
 
-TARGET = aarti
+TARGET = bhagwan-bharose
 
 all:
 	$(CC) $(CFLAGS) $(SOURCES) $(FRAMEWORKS) -lm -o $(TARGET)

@@ -1,6 +1,10 @@
-# Aarti — Native macOS Motion Application
+# Bhagwan Bharose — Native macOS Motion Application
 
 A native macOS prototype controlled by the MacBook accelerometer and gyroscope.
+Tilt and rotate the machine to perform aarti.
+
+*Bhagwan bharose* — "left to God" — the operating principle of both this
+prototype and the average midsem.
 
 ## Architecture
 
@@ -62,7 +66,7 @@ Or equivalently:
 ./build.sh
 ```
 
-Both produce the `aarti` binary.
+Both produce the `bhagwan-bharose` binary.
 
 ### Standalone terminal renderer
 
@@ -78,7 +82,7 @@ clang -O2 main.c -framework IOKit -framework CoreFoundation -lm -o mac_motion
 The AppleSPU sensor interface requires elevated access on the tested configuration:
 
 ```bash
-sudo ./aarti
+sudo ./bhagwan-bharose
 ```
 
 Keep the Mac still during calibration.
