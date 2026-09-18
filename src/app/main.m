@@ -137,7 +137,12 @@ static NSUInteger lightTrailCount = 0;
         return;
     }
 
-    if ([key isEqualToString:@"escape"]) {
+    /*
+     * charactersIgnoringModifiers returns the escape control character
+     * (0x1B) for the Esc key, not the literal string "escape".
+     */
+    if ([key length] == 1 &&
+        [key characterAtIndex:0] == 0x1B) {
         [NSApp terminate:nil];
         return;
     }

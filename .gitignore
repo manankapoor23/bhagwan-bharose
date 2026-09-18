@@ -1,0 +1,16 @@
+# Build artifacts
+aarti
+mac_motion
+test
+*.o
+*.dSYM/
+
+# Distribution archives
+*.zip
+
+# Source art originals (duplicated under assets/)
+62000844-8177-46e2-8065-535b0e04ac06.png
+c4592d01-7738-4f4f-81d5-5c8b36c4e85f.png
+
+# macOS
+.DS_Store
