@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 
 #include "../motion/imu.h"
+#include <math.h>
 
 @interface AartiView : NSView
 @end
@@ -77,18 +78,19 @@
     CGFloat centerX = bounds.size.width / 2.0;
     CGFloat centerY = bounds.size.height / 2.0;
 
-    CGFloat orbitRadius = MIN(bounds.size.width, bounds.size.height) * 0.22;
-    CGFloat yawRadians = (CGFloat)(state.yaw * 0.017453292519943295);
+    CGFloat motionRadius = MIN(bounds.size.width, bounds.size.height) * 0.22;
+    CGFloat normalizedRoll =
+        fmax(-1.0, fmin(1.0, (CGFloat)state.roll / 30.0));
+    CGFloat normalizedPitch =
+        fmax(-1.0, fmin(1.0, (CGFloat)state.pitch / 30.0));
 
     CGFloat x =
         centerX +
-        cos(yawRadians) * orbitRadius +
-        (CGFloat)state.roll * 2.0;
+        normalizedRoll * motionRadius;
 
     CGFloat y =
         centerY +
-        sin(yawRadians) * orbitRadius +
-        (CGFloat)state.pitch * 2.0;
+        normalizedPitch * motionRadius;
 
     NSPoint p = NSMakePoint(x, y);
 
