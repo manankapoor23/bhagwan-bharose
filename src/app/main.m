@@ -77,18 +77,18 @@
     CGFloat centerX = bounds.size.width / 2.0;
     CGFloat centerY = bounds.size.height / 2.0;
 
-    CGFloat radius = 150.0;
+    CGFloat orbitRadius = MIN(bounds.size.width, bounds.size.height) * 0.22;
+    CGFloat yawRadians = (CGFloat)(state.yaw * 0.017453292519943295);
 
     CGFloat x =
         centerX +
-        (CGFloat)state.roll * 5.0;
+        cos(yawRadians) * orbitRadius +
+        (CGFloat)state.roll * 2.0;
 
     CGFloat y =
         centerY +
-        (CGFloat)state.pitch * 5.0;
-
-    x = MAX(centerX - radius, MIN(centerX + radius, x));
-    y = MAX(centerY - radius, MIN(centerY + radius, y));
+        sin(yawRadians) * orbitRadius +
+        (CGFloat)state.pitch * 2.0;
 
     NSPoint p = NSMakePoint(x, y);
 
