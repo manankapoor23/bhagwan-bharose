@@ -2,11 +2,17 @@
 
 #include "../motion/imu.h"
 #include <math.h>
+#include <string.h>
+
+#define TRAIL_LENGTH 120
 
 @interface AartiView : NSView
 @end
 
 @implementation AartiView
+
+static NSPoint lightTrail[TRAIL_LENGTH];
+static NSUInteger lightTrailCount = 0;
 
 - (BOOL)acceptsFirstResponder {
     return YES;
@@ -80,9 +86,9 @@
 
     CGFloat motionRadius = MIN(bounds.size.width, bounds.size.height) * 0.22;
     CGFloat normalizedRoll =
-        fmax(-1.0, fmin(1.0, (CGFloat)state.roll / 30.0));
+        fmax(-1.0, fmin(1.0, (CGFloat)state.roll / 15.0));
     CGFloat normalizedPitch =
-        fmax(-1.0, fmin(1.0, (CGFloat)state.pitch / 30.0));
+        fmax(-1.0, fmin(1.0, (CGFloat)state.pitch / 15.0));
 
     CGFloat x =
         centerX +
@@ -93,6 +99,46 @@
         normalizedPitch * motionRadius;
 
     NSPoint p = NSMakePoint(x, y);
+
+    if (!state.calibrated) {
+        lightTrailCount = 0;
+    } else if (lightTrailCount == 0 ||
+               hypot(p.x - lightTrail[lightTrailCount - 1].x,
+                     p.y - lightTrail[lightTrailCount - 1].y) > 3.0) {
+        if (lightTrailCount == TRAIL_LENGTH) {
+            memmove(
+                lightTrail,
+                lightTrail + 1,
+                sizeof(NSPoint) * (TRAIL_LENGTH - 1)
+            );
+            lightTrailCount--;
+        }
+
+        lightTrail[lightTrailCount++] = p;
+    }
+
+    for (NSUInteger index = 0; index < lightTrailCount; index++) {
+        CGFloat opacity =
+            0.05 + 0.35 * ((CGFloat)index / (CGFloat)TRAIL_LENGTH);
+        CGFloat dotSize =
+            4.0 + 8.0 * ((CGFloat)index / (CGFloat)TRAIL_LENGTH);
+
+        [[NSColor colorWithCalibratedRed:1.0
+                                   green:0.55
+                                    blue:0.08
+                                   alpha:opacity] setFill];
+
+        NSBezierPath *dot =
+            [NSBezierPath bezierPathWithOvalInRect:
+                NSMakeRect(
+                    lightTrail[index].x - dotSize / 2.0,
+                    lightTrail[index].y - dotSize / 2.0,
+                    dotSize,
+                    dotSize
+                )];
+
+        [dot fill];
+    }
 
     [[NSColor colorWithCalibratedRed:0.75
                                green:0.55
