@@ -90,7 +90,7 @@ static NSUInteger lightTrailCount = 0;
 
     if (state.calibrated && horizontalAcceleration > 0.015) {
         accelerationAngle = atan2(
-            state.acceleration_y,
+            -state.acceleration_y,
             state.acceleration_x
         );
     }
