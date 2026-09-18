@@ -84,30 +84,35 @@ static NSUInteger lightTrailCount = 0;
     CGFloat centerX = bounds.size.width / 2.0;
     CGFloat centerY = bounds.size.height / 2.0;
 
-    static CGFloat accelerationAngle = 0.0;
-    CGFloat horizontalAcceleration =
-        hypot(state.acceleration_x, state.acceleration_y);
-
-    if (state.calibrated && horizontalAcceleration > 0.015) {
-        accelerationAngle = atan2(
-            -state.acceleration_y,
-            state.acceleration_x
-        );
-    }
-
     CGFloat motionRadius = MIN(bounds.size.width, bounds.size.height) * 0.20;
-    CGFloat normalizedAcceleration =
-        fmax(0.0, fmin(1.0, horizontalAcceleration / 0.35));
-    CGFloat orbitRadius =
-        motionRadius * (0.35 + normalizedAcceleration * 0.65);
+    static CGFloat lightOffsetX = 0.0;
+    static CGFloat lightOffsetY = 0.0;
+    static CFTimeInterval lastMotionTime = 0.0;
+    CFTimeInterval motionTime = CFAbsoluteTimeGetCurrent();
+    CGFloat motionDelta = lastMotionTime > 0.0
+        ? (CGFloat)(motionTime - lastMotionTime)
+        : 0.0;
+
+    motionDelta = fmax(0.0, fmin(0.05, motionDelta));
+    lastMotionTime = motionTime;
+
+    if (!state.calibrated) {
+        lightOffsetX = 0.0;
+        lightOffsetY = 0.0;
+    } else {
+        lightOffsetX += (CGFloat)state.gyro_y * motionDelta * 4.0;
+        lightOffsetY -= (CGFloat)state.gyro_x * motionDelta * 4.0;
+        lightOffsetX = fmax(-motionRadius, fmin(motionRadius, lightOffsetX));
+        lightOffsetY = fmax(-motionRadius, fmin(motionRadius, lightOffsetY));
+    }
 
     CGFloat x =
         centerX +
-        cos(accelerationAngle) * orbitRadius;
+        lightOffsetX;
 
     CGFloat y =
         centerY +
-        sin(accelerationAngle) * orbitRadius;
+        lightOffsetY;
 
     NSPoint p = NSMakePoint(x, y);
 
