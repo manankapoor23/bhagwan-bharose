@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <sys/time.h>
 
 // Constants
 #define PAGE_VENDOR 0xFF00
@@ -20,6 +21,9 @@
 #define IMU_DATA_OFFSET 6
 #define REPORT_BUFFER_SIZE 4096
 #define REPORT_INTERVAL_US 1000
+#define ART_WIDTH 64
+#define ART_HEIGHT 24
+#define ART_FRAME_INTERVAL_US 50000
 
 static uint8_t reportBuffer[REPORT_BUFFER_SIZE];
 
@@ -29,6 +33,7 @@ static int setRegistryIntegerProperty(io_service_t service, const char *key, int
 static void inputReportCallback(void *context, IOReturn result, void *sender, IOHIDReportType type, uint32_t reportID, uint8_t *report, CFIndex reportLength);
 static int wakeSPUDrivers(void);
 static IOHIDDeviceRef findAccelerometer(void);
+static void drawArt(double xG, double yG, double magnitude);
 
 int main(void) {
     // 1. Wake Apple SPU Drivers
@@ -93,7 +98,9 @@ int main(void) {
     // 6. Run
     printf("\nListening for accelerometer data...\n");
 
-    printf("Try moving or tapping the MacBook.\n\n");
+    printf("Touch or move the MacBook to paint. Press Control-C to stop.\n\n");
+    printf("\033[2J\033[H\033[?25l");
+    fflush(stdout);
 
     CFRunLoopRun();
 
@@ -243,7 +250,9 @@ static void inputReportCallback(
 
         double deviation = magnitude - 1.0;
 
-        if (deviation > 0.09) {
+        drawArt(xG, yG, magnitude);
+
+        if (deviation > 0.00001) {
             printf(
                 "ACCEL:     Magnitude=%.4f | Deviation=%+.4f g\n",
                 magnitude,
@@ -251,6 +260,49 @@ static void inputReportCallback(
             );
         }
     }
+}
+
+static void drawArt(double xG, double yG, double magnitude) {
+    static uint64_t lastFrameTime = 0;
+    static int initialized = 0;
+    struct timeval currentTime;
+
+    gettimeofday(&currentTime, NULL);
+
+    uint64_t now = (uint64_t)currentTime.tv_sec * 1000000ULL +
+                   (uint64_t)currentTime.tv_usec;
+
+    if (initialized && now - lastFrameTime < ART_FRAME_INTERVAL_US) {
+        return;
+    }
+
+    initialized = 1;
+    lastFrameTime = now;
+
+    double clampedX = fmax(-1.0, fmin(1.0, xG));
+    double clampedY = fmax(-1.0, fmin(1.0, yG));
+    int centerX = (int)((clampedX + 1.0) * 0.5 * (ART_WIDTH - 1));
+    int centerY = (int)((1.0 - clampedY) * 0.5 * (ART_HEIGHT - 1));
+    int radius = (int)fmax(1.0, fmin(7.0, fabs(magnitude - 1.0) * 18.0 + 1.0));
+    const char *ink = magnitude > 1.15 ? "@" : (magnitude > 1.05 ? "*" : ".");
+
+    printf("\033[H");
+    for (int row = 0; row < ART_HEIGHT; row++) {
+        for (int column = 0; column < ART_WIDTH; column++) {
+            int dx = column - centerX;
+            int dy = row - centerY;
+            double distance = sqrt((double)(dx * dx + dy * dy));
+
+            if (distance <= radius) {
+                printf("%s", ink);
+            } else {
+                printf(" ");
+            }
+        }
+        printf("\n");
+    }
+    printf("magnitude %.4f  brush %d  position (%d, %d)\n", magnitude, radius, centerX, centerY);
+    fflush(stdout);
 }
 
 static int wakeSPUDrivers(void) {
